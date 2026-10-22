@@ -9,7 +9,7 @@
 //   node short.mjs render  <project> [--scale .5] [--fps 30] [--from a --to b] [--workers 2] [--jpeg] [--eco] [--out file.mp4]
 //   node short.mjs audio   <project>            music bed + SFX + ducked voice -> assets/mix.wav
 //   node short.mjs final   <project>            mux, poster, QC -> output/<slug>.mp4
-//   node short.mjs all     <project>            render + audio + final
+//   node short.mjs all     <project>            render (audio mixed beside it) + final
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,6 +20,7 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mapper, mapSpec } from './lib/timeline.js';
 import { withStyle } from './lib/style.js';
+import { openChrome } from './chrome.mjs';
 import { CHROME, FFMPEG, FFPROBE, eco, h264, hasEncoder, visionTool } from './platform.mjs';
 
 const ENGINE = path.dirname(fileURLToPath(import.meta.url));
@@ -363,13 +364,53 @@ function plateFrame(spec) {
   ff(['-i', P(src), '-frames:v', '1', '-vf', `scale=${sw}:${sh},crop=${cw}:${ch}:${cx}:${cy}${g ? ',' + gradeChain(g) : ''}`, '-q:v', '2', P('frames/plate.jpg')]);
   log('vanish: plate -> frames/plate.jpg');
 }
+// true when every use of media `id` in the spec is an `overlay` scene's media (the only draw that maps a cropped frame
+// back to its place); any other mention of the id (an actor, a card, a tweet avatar, a list) keeps the whole frame
+function overlayOnly(spec, id) {
+  let ok = false;
+  const walk = (o, k, parent) => {
+    if (o === id) { if (k === 'media' && parent?.type === 'overlay' && !Array.isArray(parent)) ok ||= true; else throw 0; return; }
+    if (o && typeof o === 'object') for (const [kk, v] of Object.entries(o)) walk(v, kk, o);
+  };
+  try { for (const [k, v] of Object.entries(spec)) if (k !== 'media') walk(v, k, spec); } catch { return false; }
+  return ok;
+}
+// alpha media drawn only by overlay scenes: the box that is ever visible (alpha > 0 on any frame, + 2 px so edge
+// filtering stays the same), measured on the exact frames the extraction makes (same input, same -vf).
+// -> {box: [x, y, w, h], w, h (the whole frame)}, or null when the box would save under 10 % of the pixels
+function alphaBox(input, vf) {
+  const r = spawnSync(FFMPEG, ['-hide_banner', ...input, '-vf', vf + ',alphaextract,bbox=min_val=1', '-an', '-f', 'null', '-'], { encoding: 'utf8', maxBuffer: 1 << 28 });
+  const size = r.stderr.match(/Output #0[\s\S]*?Stream #0:0[^\n]*?, (\d+)x(\d+)/);
+  if (r.status || !size) return null;
+  const W0 = +size[1], H0 = +size[2];
+  let x1 = 1e9, y1 = 1e9, x2 = -1, y2 = -1;
+  for (const m of r.stderr.matchAll(/x1:(\d+) x2:(\d+) y1:(\d+) y2:(\d+)/g)) {
+    const [a, b, c, d] = m.slice(1).map(Number); if (b < a || d < c) continue;
+    x1 = Math.min(x1, a); x2 = Math.max(x2, b); y1 = Math.min(y1, c); y2 = Math.max(y2, d);
+  }
+  if (x2 < 0) return null;
+  x1 = Math.max(0, x1 - 2); y1 = Math.max(0, y1 - 2); x2 = Math.min(W0 - 1, x2 + 2); y2 = Math.min(H0 - 1, y2 + 2);
+  const box = [x1, y1, x2 - x1 + 1, y2 - y1 + 1];
+  return box[2] * box[3] > .9 * W0 * H0 ? null : { box, w: W0, h: H0 };
+}
+// frames identical to an earlier one (a UI holding still, a frozen B-roll) -> {frame: first identical frame}: the page
+// fetches and decodes each picture once (mediaURL in the runtimes)
+function repeats(dir) {
+  const alias = {}, seen = new Map();
+  for (const f of fs.readdirSync(dir).sort()) {
+    const i = parseInt(f, 10); if (!(i >= 0)) continue;
+    const h = md5(fs.readFileSync(path.join(dir, f))); if (seen.has(h)) alias[i] = seen.get(h); else seen.set(h, i);
+  }
+  return alias;
+}
 function extractMedia(spec, prev, tl) {
   const out = {};
   for (const [id, m] of Object.entries(spec.media || {})) {
     // the key holds the file's size and mtime too: a clip re-encoded under the same name (a component captured again) is re-extracted
     const fp = path.resolve(PROJ, expand(m.src)), fst = fs.existsSync(fp) ? fs.statSync(fp) : null, stamp = fst && [fst.size, Math.round(fst.mtimeMs)];
-    const key = JSON.stringify(m.sync ? [m, tl.keeps, tl.speed, stamp] : [m, stamp]), dir = P('frames/media', id);
-    if (prev?.[id]?.key === key && fs.existsSync(dir)) { out[id] = prev[id]; continue; }
+    const crops = !!m.alpha && !m.sync && overlayOnly(spec, id);
+    const key = JSON.stringify(m.sync ? [m, tl.keeps, tl.speed, stamp] : [m, stamp, ...(crops ? ['crop1'] : [])]), dir = P('frames/media', id);
+    if (prev?.[id]?.key === key && fs.existsSync(dir)) { out[id] = { ...prev[id], alias: prev[id].alias || repeats(dir) }; continue; }
     fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true });
     // fill: true crops the clip to the frame's aspect first (full-screen B-roll, spec.broll), around focus [x, y] (0..1)
     const [FW, FH] = frameWH(), [fx, fy] = m.focus || [.5, .5], w = m.width || (m.fill ? FW : 960);
@@ -377,13 +418,20 @@ function extractMedia(spec, prev, tl) {
     // alpha: true keeps the clip's transparency (a UI overlay rendered on a transparent background, e.g. a png-in-mov or a
     // ProRes 4444) as RGBA PNG frames, for the `overlay` scene; every other clip is JPG
     const ext = m.alpha ? 'png' : 'jpg', enc = m.alpha ? ['-pix_fmt', 'rgba'] : ['-q:v', '1', '-qmin', '1'];
+    let crop = null;
     if (m.sync) extractSynced(m, dir, tl, fill, w);
-    else ff(['-threads', '4', ...(m.from ? ['-ss', String(m.from)] : []), ...(m.dur ? ['-t', String(m.dur)] : []), '-i', path.resolve(PROJ, expand(m.src)),
-      '-vf', `fps=${FPS},${fill}scale=${w}:-2:flags=lanczos${m.alpha ? ',format=rgba' : ''}`, '-an', ...enc, '-start_number', '0', path.join(dir, `%05d.${ext}`)]);
+    else {
+      const input = ['-threads', '4', ...(m.from ? ['-ss', String(m.from)] : []), ...(m.dur ? ['-t', String(m.dur)] : []), '-i', path.resolve(PROJ, expand(m.src))];
+      let vf = `fps=${FPS},${fill}scale=${w}:-2:flags=lanczos${m.alpha ? ',format=rgba' : ''}`;
+      // an overlay is mostly transparent: only its visible box is stored (about half the pixels to decode and draw per frame)
+      if (crops && (crop = alphaBox(input, vf))) vf += `,crop=${crop.box[2]}:${crop.box[3]}:${crop.box[0]}:${crop.box[1]}`;
+      ff([...input, '-vf', vf, '-an', ...enc, '-start_number', '0', path.join(dir, `%05d.${ext}`)]);
+    }
     const jpgs = fs.readdirSync(dir).filter(f => f.endsWith('.' + ext)).sort(), count = m.sync ? parseInt(jpgs.at(-1) || '-1', 10) + 1 : jpgs.length;
-    const [iw, ih] = probe(path.join(dir, jpgs[0]), 'stream=width,height').split('\n').map(Number);
-    out[id] = { count, w: iw, h: ih, key, ...(m.sync ? { sync: true } : {}), ...(m.alpha ? { ext } : {}) };
-    log(`media ${id}: ${count} frames ${iw}x${ih}`);
+    const [iw, ih] = crop ? [crop.w, crop.h] : probe(path.join(dir, jpgs[0]), 'stream=width,height').split('\n').map(Number);
+    const alias = repeats(dir), reps = Object.keys(alias).length;
+    out[id] = { count, w: iw, h: ih, key, ...(m.sync ? { sync: true } : {}), ...(m.alpha ? { ext } : {}), ...(crop ? { crop: crop.box } : {}), alias };
+    log(`media ${id}: ${count} frames ${iw}x${ih}${crop ? `, visible box ${crop.box[2]}x${crop.box[3]}` : ''}${reps ? `, ${reps} repeats` : ''}`);
   }
   return out;
 }
@@ -520,18 +568,19 @@ function serve(sinks = {}, port = 0, home = null) {
   const srv = http.createServer((req, res) => {
     const u = decodeURIComponent(req.url.split('?')[0]);
     if (home && u === '/') { res.writeHead(302, { location: home }); return res.end(); }
-    // POST /sink/<k>?n=<frames done>: encoded video bytes from a render worker, appended in arrival order
+    // POST /sink/<k>?n=<frames done>[&end=1]: encoded video bytes of one work unit from a render worker, in order
     if (req.method === 'POST' && u.startsWith('/sink/')) {
       const k = u.slice(6), sk = sinks[k];
       if (!sk) { res.writeHead(404); return res.end(); }
-      req.on('data', b => sk.out.write(b)); req.on('end', () => { sk.done = +new URL(req.url, 'http://x').searchParams.get('n'); sk.tick?.(); res.end(); });
+      req.on('data', b => sk.data(b));
+      req.on('end', () => { const q = new URL(req.url, 'http://x').searchParams; sk.done = +q.get('n'); sk.tick?.(); if (q.has('end')) sk.end?.(); res.end(); });
       return;
     }
     // /style.json: the project's style snapshot ({} when none), /style-font: its font file (style.font.src)
     if (u === '/style.json') { res.writeHead(200, { 'content-type': MIME['.json'], 'cache-control': 'no-store' }); return res.end(JSON.stringify(loadStyle() || {})); }
     const fsrc = u === '/style-font' && loadStyle()?.font?.src;
     const f = fsrc ? expand(fsrc) : u.startsWith('/engine/') ? path.join(ENGINE, u.slice(8)) : u.startsWith('/p/') ? projFile(u.slice(3)) : null;
-    if (!f || !fs.existsSync(f) || fs.statSync(f).isDirectory()) { res.writeHead(404); return res.end(); }
+    if (!f || !fs.existsSync(f) || fs.statSync(f).isDirectory()) { console.log('  page 404:', u); res.writeHead(404); return res.end(); }
     res.writeHead(200, { 'content-type': MIME[path.extname(f)] || 'application/octet-stream', 'cache-control': 'no-store' });
     fs.createReadStream(f).pipe(res);
   });
@@ -558,22 +607,32 @@ async function ensureMatte() {
   if (f?.cutKey && !fs.existsSync(P('frames/matte'))) { log('matte missing (old format), re-running prepare'); await prepare(); }
 }
 
+const bootLog = b => b && log(`boot: fonts ${b.fonts?.toFixed(0)} ms, paper background ${b.bg?.toFixed(0)} ms, ready at ${b.ready?.toFixed(0)} ms`);
+
+// One headless Chrome on the runtime page, driven over its DevTools pipe (chrome.mjs): the page boots ~0.3 s sooner than
+// through Playwright (benchmark 2026-10-21, M4 Max: 0.9 -> 0.6 s for 2 render workers). Playwright stays as the fallback
+// when that Chrome does not start; an error of the page itself (window.READY_ERROR) is thrown as is.
 async function openPage(srv, scale) {
+  const [WW, HH] = frameWH(), [SW, SH] = stageWH();
+  const url = `http://127.0.0.1:${srv.address().port}/engine/short.html?scale=${scale}&w=${SW}&h=${SH}&ow=${WW}&oh=${HH}${flag('ahead') ? '&ahead=' + flag('ahead') : ''}`;
+  try {
+    const pg = await openChrome(CHROME, url, { width: WW / 2, height: HH / 2, args: ['--renderer-process-limit=1'] });
+    if (flag('bench')) bootLog(await pg.evaluate(() => window.PERF_BOOT));
+    return { page: { evaluate: pg.evaluate }, close: pg.close };
+  } catch (e) { if (e.page) throw e; log(`chrome pipe failed (${e.message.split('\n')[0]}), Playwright instead`); }
   const { chromium } = await import('playwright-core');
   // launchServer + kill: a graceful browser.close() of headless Chrome takes ~2.4 s on macOS, kill() ~30 ms. Nothing is
-  // lost: every caller awaits its last result (encodeRange awaits its final POST) before closing.
+  // lost: every caller awaits its last result (encodeEnd awaits its final POST) before closing.
   const bs = await chromium.launchServer({ executablePath: CHROME, headless: true, args: ['--renderer-process-limit=1', '--disable-extensions', '--mute-audio'] });
   const browser = await chromium.connect(bs.wsEndpoint()), kill = () => bs.kill();
-  const [WW, HH] = frameWH(), page = await browser.newPage({ viewport: { width: WW / 2, height: HH / 2 } });
+  const page = await browser.newPage({ viewport: { width: WW / 2, height: HH / 2 } });
   page.on('console', m => { if (m.type() === 'error' || m.text().startsWith('[rt]')) console.log('  page:', m.text()); });
-  page.on('response', r => { if (r.status() === 404) console.log('  page 404:', r.url().replace(/^https?:\/\/[^/]+/, '')); });
   page.on('pageerror', e => console.log('  pageerror:', e.message));
-  const [SW, SH] = stageWH();
-  await page.goto(`http://127.0.0.1:${srv.address().port}/engine/short.html?scale=${scale}&w=${SW}&h=${SH}&ow=${WW}&oh=${HH}${flag('ahead') ? '&ahead=' + flag('ahead') : ''}`);
+  await page.goto(url);
   await page.waitForFunction(() => window.READY === true || window.READY_ERROR, null, { timeout: 60000 });
   const err = await page.evaluate(() => window.READY_ERROR);
   if (err) { await kill(); throw new Error(err); }
-  if (flag('bench')) { const b = await page.evaluate(() => window.PERF_BOOT); b && log(`boot: fonts ${b.fonts?.toFixed(0)} ms, paper background ${b.bg?.toFixed(0)} ms, ready at ${b.ready?.toFixed(0)} ms`); }
+  if (flag('bench')) bootLog(await page.evaluate(() => window.PERF_BOOT));
   return { page, close: kill };
 }
 
@@ -651,6 +710,14 @@ async function capture() {
   log(`capture ${name}: ${n} frames ${w}x${h}${alpha ? ' alpha' : ''} -> ${out.startsWith(PROJ) ? path.relative(PROJ, out) : out} (${(n / fps).toFixed(2)} s) + stills/${name}-sheet.jpg (t ${ts.map(t => t.toFixed(2)).join(' ')})`);
 }
 
+// decode check of an Annex B piece (software decode, about 1 s per 30 s of 1080x1920): resolves, or rejects with the error
+const decodes = (buf, a, b) => new Promise((res, rej) => {
+  const p = spawn(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-f', 'h264', '-i', '-', '-f', 'null', '-'], { stdio: ['pipe', 'ignore', 'pipe'] }); let e = '';
+  p.stderr.on('data', d => { e += d; }); p.stdin.on('error', () => {}); p.once('error', rej);
+  p.once('close', c => c ? rej(new Error(`frames ${a}-${b} do not decode: ${e.slice(-300)}`)) : res());
+  p.stdin.end(buf);
+});
+
 // Render cache keys. global: the engine code, style, timeline, prepared frames, the output settings and every spec field
 // that is not windowed. Per chunk: the windowed timed items that can draw in it (scenes, actors, broll: from - pre - 2
 // to to + 2) and the layout/zoom keys that move it (the last key 6 s before the chunk onward: the spring has settled by then),
@@ -677,6 +744,28 @@ function renderChunks(tl, n0, n1, fps, W, H, rate, scale) {
   return out;
 }
 
+// The mp4 mux, started before the encode: chunks go into ffmpeg's stdin in order as soon as each one is there (cached,
+// or just encoded), so most of the parsing overlaps the encode and no joined .h264 is written. Every chunk starts on an
+// IDR with its own SPS/PPS, so the Annex B streams concatenate as is. Chrome's SPS timing confuses the raw parser:
+// rebuild timestamps from the frame index (setts), tag bt709 limited range, in the SPS and in the MP4 colr box (left
+// alone, the box keeps WebCodecs' sRGB transfer and players trust the box). Written to <out>.part, renamed when done,
+// so a failed render leaves the previous video in place.
+function muxer(chunks, out, fps) {
+  const part = out + '.part', p = spawn(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'h264', '-i', '-', '-c:v', 'copy', '-bsf:v',
+    `h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1,setts=ts=N/(${fps}*TB):duration=1/(${fps}*TB)`,
+    ...BT709, '-video_track_timescale', String(fps * 1000), '-movflags', '+faststart', '-f', 'mp4', part], { stdio: ['pipe', 'inherit', 'inherit'] });
+  const done = new Promise((res, rej) => p.on('close', c => c ? rej(new Error('ffmpeg mux exit ' + c)) : res())); done.catch(() => {});
+  p.stdin.on('error', () => {});   // a dead ffmpeg surfaces through `done`
+  const write = b => new Promise(r => p.stdin.write(b, () => r()));
+  let i = 0, chain = Promise.resolve();
+  const feed = () => (chain = chain.then(async () => { for (; i < chunks.length && chunks[i].ready; i++) await write(chunks[i].buf || fs.readFileSync(chunks[i].f)); }));
+  return {
+    feed,
+    async end() { await feed(); if (i < chunks.length) throw new Error('mux: chunk missing'); p.stdin.end(); await done; fs.renameSync(part, out); },
+    abort() { p.kill(); try { fs.unlinkSync(part); } catch {} },
+  };
+}
+
 async function render() {
   await ensureMatte();
   const tl = readJSON(P('assets/timeline.json'));
@@ -687,58 +776,86 @@ async function render() {
   const out = flag('out') ? path.resolve(PROJ, flag('out')) : P('output', draft ? 'draft-video.mp4' : 'video.mp4');   // --out <path>: e.g. a test clip
   const W = Math.round(frameWH()[0] * scale / 2) * 2, H = Math.round(frameH() * scale / 2) * 2;
   const rate = draft ? 4e6 : W * H > 1.5e6 ? 32e6 : 18e6;
-  // workers: parallel Chrome renderers pulling 10 s chunks (default 2: ~8x realtime at 1080p on an M4 Max, 1 = ~7x, 4 is slower:
-  // the hardware encoder is the limit; --workers n)
+  // workers: parallel Chrome renderers sharing 2 s work units (default 2; the hardware encoder is the limit: 3 workers or a
+  // deeper encode queue are 5-10 % slower, benchmark 2026-10-21 on an M4 Max; --workers n)
   const K = Math.max(1, Math.min(+flag('workers', 2), Math.floor(N / 30) || 1));
   const start = Date.now(), jpeg = () => renderJPEG({ scale, fps, n0, N, out, W, H, draft, start });
   if (flag('jpeg')) return jpeg();
   // chunk cache: 10 s chunks on absolute frame numbers, each keyed by what can change its pixels. A spec fix
   // re-encodes only the chunks it touches; the rest are reused byte for byte (each chunk opens on an IDR). --fresh skips it.
   const chunks = renderChunks(tl, n0, n1, fps, W, H, rate, scale), fresh = !!flag('fresh');
-  for (const c of chunks) c.hit = !fresh && fs.existsSync(c.f);
+  for (const c of chunks) c.hit = c.ready = !fresh && fs.existsSync(c.f);
+  let mux = null;
   const todo = chunks.filter(c => !c.hit), N2 = todo.reduce((x, c) => x + c.b - c.a, 0);
-  log(`render ${N} frames ${W}x${H}@${fps}: ${chunks.length - todo.length}/${chunks.length} chunks cached, ${N2} frames to encode, ${Math.min(K, todo.length)} workers -> ${out}`);
+  log(`render ${N} frames ${W}x${H}@${fps}: ${chunks.length - todo.length}/${chunks.length} chunks cached, ${N2} frames to encode, ${Math.min(K, todo.reduce((x, c) => x + Math.ceil((c.b - c.a) / (2 * fps)), 0))} workers -> ${out}`);
   let fallback = null;
   if (todo.length) {
-    const sinks = {}, perf = {}; let lastPct = -1, base = 0;
+    // work units: 2 s pieces of the chunks to encode, each opening on a keyframe (the same keyframes as one encoder per
+    // chunk). Each worker starts on its own contiguous run, an equal share of the frames (its image cache stays warm); a
+    // worker that runs out takes the back half of the longest run left, so the workers finish together instead of one
+    // waiting on the other's last 10 s chunk. A chunk lands in the cache (.part, then rename) once all its units are in.
+    const G = 2 * fps, units = [];
+    for (const c of todo) { c.parts = []; for (let a = c.a; a < c.b; a += G) { const u = { c, a, b: Math.min(c.b, a + G), bufs: [] }; c.parts.push(u); units.push(u); } c.left = c.parts.length; }
+    const nw = Math.min(K, units.length), runs = Array.from({ length: nw }, () => []);
+    { let acc = 0; for (const u of units) { runs[Math.min(nw - 1, Math.floor((acc + (u.b - u.a) / 2) * nw / N2))].push(u); acc += u.b - u.a; } }
+    let steals = 0;
+    const next = run => {
+      if (!run.length) { const v = runs.reduce((m, r) => r.length > m.length ? r : m); if (v.length) { steals++; run.push(...v.splice(v.length >> 1)); } }
+      return run.shift();
+    };
+    const sinks = {}, perf = {}, writes = []; let lastPct = -1, base = 0, uid = 0, bad = null;
     const tick = () => {
       const d = base + Object.values(sinks).reduce((x, s) => x + s.done, 0), pct = Math.floor(d / N2 * 20) * 5;
       if (pct !== lastPct) { lastPct = pct; const el = (Date.now() - start) / 1000; log(`${pct}% (${d}/${N2}) ${(d / el).toFixed(1)} fps, eta ${Math.round((N2 - d) / (d / el || 1))}s`); }
     };
-    const s2 = await serve(sinks), queue = [...todo];
+    const finish = u => {   // every frame of unit u is in
+      const done = sinks[u.id].done; delete sinks[u.id]; base += u.b - u.a;
+      if (done !== u.b - u.a) bad ||= new Error(`frames ${u.a}-${u.b}: the encoder returned ${done} of ${u.b - u.a} frames`);
+      // decode check: the unit opens on an IDR with its SPS/PPS, so it decodes on its own, while the hardware encoder
+      // works on the next units (the CPU is mostly idle then). `final` no longer decodes the whole video after the render.
+      u.ok = decodes(Buffer.concat(u.bufs), u.a, u.b); u.ok.catch(() => {});
+      const c = u.c; if (--c.left) return;
+      c.buf = Buffer.concat(c.parts.flatMap(p => p.bufs)); c.ready = true;
+      // into the cache once every unit of it decoded
+      const w = Promise.all(c.parts.map(p => p.ok)).then(() => fs.promises.writeFile(c.f + '.part', c.buf)).then(() => fs.promises.rename(c.f + '.part', c.f)).then(() => { c.buf = null; });
+      w.catch(() => {}); writes.push(w); c.parts = null;
+      mux?.feed();
+    };
+    const s2 = await serve(sinks);
     try {
-      const b0 = Date.now(), pages = await Promise.all(Array.from({ length: Math.min(K, todo.length) }, () => openPage(s2, scale)));
+      const b0 = Date.now(), pages = await Promise.all(Array.from({ length: nw }, () => openPage(s2, scale)));
       perf.boot = Date.now() - b0;
       try {
         fallback = !(await pages[0].page.evaluate(async ([width, height, bitrate]) => window.HAS_WEBCODECS && (await VideoEncoder.isConfigSupported({ codec: 'avc1.640034', width, height, bitrate, framerate: 30, avc: { format: 'annexb' } }).catch(() => ({}))).supported, [W, H, rate]));
-        // each worker pulls the next missing chunk; a chunk lands in the cache only once fully encoded (.part, then rename)
-        if (!fallback) await Promise.all(pages.map(async ({ page }) => {
-          for (let c; (c = queue.shift());) {
-            const sk = sinks[c.id] = { out: fs.createWriteStream(c.f + '.part'), done: 0, tick };
-            const r = await page.evaluate(([a, b, fps, sink, rate]) => window.encodeRange(a, b, fps, sink, rate), [c.a, c.b, fps, `/sink/${c.id}`, rate]);
-            for (const [k, v] of Object.entries(r?.perf || {})) perf[k] = (perf[k] || 0) + v;
-            await new Promise(r => sk.out.end(r)); fs.renameSync(c.f + '.part', c.f);
-            base += c.b - c.a; delete sinks[c.id]; tick();
-          }
-        }));
+        if (!fallback) {
+          mux = muxer(chunks, out, fps);
+          await Promise.all(pages.map(async ({ page }, w) => {
+            await page.evaluate(([fps, rate]) => window.encodeStart(fps, rate), [fps, rate]);
+            for (let u; (u = next(runs[w]));) {
+              u.id = String(++uid); sinks[u.id] = { data: b => u.bufs.push(b), end: () => finish(u), done: 0, tick };
+              await page.evaluate(([a, b, sink]) => window.encodeUnit(a, b, sink), [u.a, u.b, `/sink/${u.id}`]);
+            }
+            const r = await page.evaluate(() => window.encodeEnd());
+            for (const [k, v] of Object.entries(r || {})) perf[k] = (perf[k] || 0) + v;
+          }));
+          if (bad) throw bad;
+          await Promise.all(units.map(u => u.ok));   // every unit decoded
+          await Promise.all(writes);
+        }
       } finally { await Promise.all(pages.map(p => p.close().catch(() => {}))); }
-    } finally { s2.close(); }
+    } catch (e) { mux?.abort(); throw e; } finally { s2.close(); }
     if (fallback) { log('no H.264 WebCodecs in this browser: JPEG fallback'); return jpeg(); }
     // benchmark: where each frame's time goes, summed over the workers (ms per frame), and the wall clock of the encode
     if (perf.frames) { const per = k => (perf[k] / perf.frames).toFixed(1), wall = (Date.now() - start) / 1000;
-      log(`bench: boot ${(perf.boot / 1000).toFixed(1)}s, ${N2} frames in ${wall.toFixed(1)}s = ${(N2 / wall).toFixed(0)} fps (${(N2 / fps / wall).toFixed(1)}x realtime), per frame: images ${per('load')} ms, draw ${(+per('render') - +per('load')).toFixed(1)} ms, encode ${(+per('submit') + +per('encWait')).toFixed(1)} ms`);
-      if (flag('bench')) fs.writeFileSync(flag('bench'), JSON.stringify({ frames: N2, wall, workers: Math.min(K, todo.length), ...perf }, null, 2)); }
+      log(`bench: boot ${(perf.boot / 1000).toFixed(1)}s, ${N2} frames in ${wall.toFixed(1)}s = ${(N2 / wall).toFixed(0)} fps (${(N2 / fps / wall).toFixed(1)}x realtime), per frame: images ${per('load')} ms, draw ${(+per('render') - +per('load')).toFixed(1)} ms, encode ${(+per('submit') + +per('encWait')).toFixed(1)} ms, ${steals} steals`);
+      if (flag('bench')) fs.writeFileSync(flag('bench'), JSON.stringify({ frames: N2, wall, workers: nw, steals, ...perf }, null, 2)); }
   }
-  // join: every chunk starts on an IDR with its own SPS/PPS, so the Annex B streams concatenate as is
-  const all = P('output', '.all.h264'), now = new Date();
-  const fd = fs.openSync(all, 'w');   // chunk by chunk: a long-form stream passes Node's 2 GB single-buffer limit
-  for (const c of chunks) { fs.utimesSync(c.f, now, now); fs.writeSync(fd, fs.readFileSync(c.f)); }
-  fs.closeSync(fd);
-  // Chrome's SPS timing confuses the raw parser: rebuild timestamps from the frame index (setts), tag bt709 limited range,
-  // in the SPS and in the MP4 colr box (left alone, the box keeps WebCodecs' sRGB transfer and players trust the box)
-  ff(['-f', 'h264', '-i', all, '-c:v', 'copy', '-bsf:v', `h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1,setts=ts=N/(${fps}*TB):duration=1/(${fps}*TB)`,
-    ...BT709, '-video_track_timescale', String(fps * 1000), '-movflags', '+faststart', out]);
-  fs.unlinkSync(all);
+  mux ||= muxer(chunks, out, fps);
+  const now = new Date();
+  for (const c of chunks) if (c.hit) fs.utimesSync(c.f, now, now);   // cache recency, for the prune below
+  await mux.end();
+  // every frame of this file decoded (now, or when its cached chunk was made): `final` skips its own decode of it
+  { const f = P('.cache/render/qc.json'), qc = fs.existsSync(f) ? readJSON(f) : {}, st = fs.statSync(out); qc[out] = `${st.size}:${st.mtimeMs}`; fs.writeFileSync(f, JSON.stringify(qc, null, 2)); }
   // a full-length render prunes the chunks it did not use (same size and fps), so the cache stays about one video big
   if (n0 === 0 && n1 === Math.round(tl.duration * fps)) {
     const keep = new Set(chunks.map(c => path.basename(c.f))), dir = path.dirname(chunks[0].f);
@@ -853,27 +970,43 @@ async function audio() { await import('./audio.mjs').then(m => m.buildAudio(PROJ
 // Apple AAC when ffmpeg has it: the native encoder at 192k can burst +8 dB on one frame (true peak +6.5 dBTP from a -2.2 dBFS mix)
 const AAC = () => hasEncoder('aac_at') ? ['-c:a', 'aac_at', '-b:a', '192k'] : ['-c:a', 'aac', '-b:a', '256k'];
 
-function final() {
+// async ffmpeg: resolves with its stderr (ebur128 writes a line per 100 ms of audio), rejects on a non-zero exit
+const ffRun = args => new Promise((res, rej) => {
+  const p = spawn(FFMPEG, ['-hide_banner', ...args], { stdio: ['ignore', 'ignore', 'pipe'] }); let e = '';
+  p.stderr.on('data', d => { e += d; }); p.once('error', rej);
+  p.once('close', c => c ? rej(new Error(e.slice(-400))) : res(e));
+});
+
+async function final() {
   const tl = readJSON(P('assets/timeline.json'));
   const slug = path.basename(PROJ), vid = fs.existsSync(P('output/video.mp4')) ? P('output/video.mp4') : P('output/draft-video.mp4');
   const out = P('output', `${slug}${vid.includes('draft') ? '-draft' : ''}.mp4`);
+  // the video stream is copied as is: the decode check (a full software decode, ~1 s for 30 s of 1080x1920, VideoToolbox
+  // is 3x slower here) and the poster read the render itself while the audio is encoded and muxed
+  const st = fs.statSync(vid), qf = P('.cache/render/qc.json'), inRender = fs.existsSync(qf) && readJSON(qf)[vid] === `${st.size}:${st.mtimeMs}`;
+  const check = inRender ? Promise.resolve(null) : ffRun(['-nostats', '-i', vid, '-map', '0:v', '-f', 'null', '-']).then(() => null, e => e);
+  const poster = ffRun(['-loglevel', 'error', '-y', '-ss', String(flag('poster', 1.2)), '-i', vid, '-frames:v', '1', '-q:v', '2', P('output', `${slug}-poster.jpg`)]).then(() => null, e => e);
   // written next to it then renamed: the open studio reloads on a new render and must never catch a half-written file
   const part = path.join(path.dirname(out), `.${path.basename(out)}.part`);
-  ff(['-i', vid, '-i', P('assets/mix.wav'), '-map', '0:v', '-map', '1:a', '-c:v', 'copy', ...BT709, ...AAC(), '-ar', '48000',
+  await ffRun(['-loglevel', 'error', '-y', '-i', vid, '-i', P('assets/mix.wav'), '-map', '0:v', '-map', '1:a', '-c:v', 'copy', ...BT709, ...AAC(), '-ar', '48000',
     '-t', tl.duration.toFixed(3), '-movflags', '+faststart', '-f', 'mp4', part]);
   fs.renameSync(part, out);
-  ff(['-ss', String(flag('poster', 1.2)), '-i', out, '-frames:v', '1', '-q:v', '2', P('output', `${slug}-poster.jpg`)]);
+  // loudness on the muxed AAC (it can add overs the mix did not have)
+  const eb = await ffRun(['-nostats', '-i', out, '-map', '0:a', '-af', 'ebur128=peak=true', '-f', 'null', '-']);
   const v = probe(out, 'stream=codec_name,width,height,r_frame_rate').split('\n').slice(0, 4), d = +probe(out);
-  // one pass: full video decode check + loudness on the audio only (software decode: 3.5 s for 92 s, VideoToolbox is 3x slower here)
-  // ebur128 logs a line per 100 ms (~1.5 KB/s of audio): a long-form video overflows the default 1 MB buffer and ffmpeg gets killed
-  const qc = spawnSync(FFMPEG, ['-hide_banner', '-nostats', '-i', out, '-map', '0:v', '-f', 'null', '-', '-map', '0:a', '-af', 'ebur128=peak=true', '-f', 'null', '-'], { encoding: 'utf8', maxBuffer: 1 << 28 });
-  if (qc.status) throw new Error(`QC decode failed: ${qc.stderr.slice(-400)}`);
-  const eb = qc.stderr;
+  const ce = await check; if (ce) throw new Error(`QC decode failed: ${ce.message}`);
+  const pe = await poster; if (pe) throw new Error(`poster failed: ${pe.message}`);
   const I = eb.match(/I:\s+(-?[\d.]+) LUFS/g)?.pop()?.match(/-?[\d.]+/)[0], tp = eb.match(/Peak:\s+(-?[\d.]+) dBFS/g)?.pop()?.match(/-?[\d.]+/)[0];
-  log(`QC: ${v.join(' ')} | ${d.toFixed(2)}s (timeline ${tl.duration.toFixed(2)}s) | ${I} LUFS, true peak ${tp} dBTP | decode ok`);
+  log(`QC: ${v.join(' ')} | ${d.toFixed(2)}s (timeline ${tl.duration.toFixed(2)}s) | ${I} LUFS, true peak ${tp} dBTP | decode ok${inRender ? ' (checked in render)' : ''}`);
   log(`final: ${out}`);
 }
 
-const run = { init, words, prepare, rough, stills, capture, render, audio, final, preview, all: async () => { await render(); await audio(); final(); } }[cmd];
+const run = { init, words, prepare, rough, stills, capture, render, audio, final, preview, all: async () => {
+  // the mix does not need the render: it runs beside it, in its own process (its DSP would stall this event loop, which
+  // streams the encoded units out of Chrome)
+  const a = new Promise((res, rej) => { const p = spawn(process.execPath, [fileURLToPath(import.meta.url), 'audio', ...process.argv.slice(3)], { stdio: 'inherit' });
+    p.once('error', rej); p.once('close', c => c ? rej(new Error('audio exit ' + c)) : res()); });
+  a.catch(() => {}); await render(); await a; await final();
+} }[cmd];
 if (!run) { console.error('unknown command', cmd); process.exit(1); }
 await run();

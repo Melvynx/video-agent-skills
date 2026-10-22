@@ -2,6 +2,7 @@
 // Draw order: paper BG -> stage (clipped above the deckle seam, slides with the paper) -> camera (below seam)
 // -> seam shadow -> speaker cutout -> 'over' scenes -> captions.
 import * as K from './kit.js';
+import { installEncoder } from './encode.js';
 import { mapper, mapSpec, captionChunks } from './timeline.js';
 import { SCENES, drawActor, actorNeeds, linkScenes } from './scenes.js';
 import { CAPTION_DRAW } from './scenes-meta.js';
@@ -32,8 +33,7 @@ export async function boot() {
   K.initSheet(ctx);
   const bg0 = performance.now(), BG = K.makeBackground(); PERF_BOOT.bg = performance.now() - bg0; PERF_BOOT.fonts = bg0;
 
-  // render benchmark (ms, per encodeRange call): load = waiting on frame images (fetch + decode), render = the whole
-  // render(t) including load, submit = VideoFrame + encode(), encWait = encoder backpressure, flush = the final flush
+  // render benchmark (ms, per worker, see lib/encode.js): load = waiting on frame images (fetch + decode)
   // frames prefetched ahead of the one drawn (?ahead=n, default 8): fetch + JPEG decode run in parallel instead of one
   // frame at a time. Benchmark 2026-10-21, 5 shorts, M4 Max: images waited 11.6 ms per frame with 1 ahead, 3.7 with 8
   const AHEAD = +new URLSearchParams(location.search).get('ahead') || 8;
@@ -81,7 +81,8 @@ export async function boot() {
   if (camMode && layers.at(-1)?.kind !== 'cam') layers.push({ at: cut.to, kind: 'cam', origin: [W / 2, H * .55] });
   // a layer's `img` (a full-frame alpha PNG, e.g. a giant title) sits between that layer and the person: text behind the head
   layers.forEach(L => { L.url = L.kind === 'image' ? '/p/' + L.src : null; L.imgUrl = L.img ? '/p/' + L.img : null; L.sticker ??= L.kind === 'paper'; });
-  const mediaURL = (id, ct) => { const m = frames.media[id]; return m ? `/p/frames/media/${id}/${pad5(clamp(Math.round(ct * FPS), 0, m.count - 1))}.${m.ext || 'jpg'}` : null; };
+  // m.alias: a frame identical to an earlier one loads that one (one fetch + decode, then the image cache hits)
+  const mediaURL = (id, ct) => { const m = frames.media[id]; if (!m) return null; const i = clamp(Math.round(ct * FPS), 0, m.count - 1); return `/p/frames/media/${id}/${pad5(m.alias?.[i] ?? i)}.${m.ext || 'jpg'}`; };
 
   // image logos (any `logo` / `labelLogo` that is a project image path) load while their scene or actor is on screen
   const logoUsers = [...(spec.actors || []), ...(spec.scenes || [])].map(o => {
@@ -850,7 +851,7 @@ export async function boot() {
   // Captions are drawn once on top, by render().
   function frame(t, seam, imgs, { cam = true } = {}) {
     const ref = stageRef(t), cutImg = imgs.get(cutURL(t));
-    const R = { ctx, t, spec, tl, cam: imgs.get(camURL(t)), frame: (id, ct) => imgs.get(mediaURL(id, ct)) || null, img: u => imgs.get(u) || null, U, camT, camFit: sm => camFit(t, sm), camEdge: edgePath, CW, CHh, pause: pz, pauseP: pauseP(t), allChunks, seam, seamRef: ref ?? seam };
+    const R = { ctx, t, spec, tl, cam: imgs.get(camURL(t)), frame: (id, ct) => imgs.get(mediaURL(id, ct)) || null, media: id => frames.media[id], img: u => imgs.get(u) || null, U, camT, camFit: sm => camFit(t, sm), camEdge: edgePath, CW, CHh, pause: pz, pauseP: pauseP(t), allChunks, seam, seamRef: ref ?? seam };
     ctx.drawImage(BG, 0, 0);
     if (CARD) {   // card layout: stage above the card, header, the camera card, then 'over' scenes
       ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, CARD.y - 6); ctx.clip();
@@ -955,31 +956,8 @@ export async function boot() {
     captions(t, top, { from: sA, to: sB, p, camTop: top <= 2 ? -1e4 : top });
   }
 
-  // Render frames [n0, n1) and hardware-encode them right here (WebCodecs H.264, Annex B, VideoToolbox on a Mac).
-  // The bytes stream in order to the CLI's local server (`sink`), so no JPEG is ever made and nothing big crosses CDP.
-  window.encodeRange = async (n0, n1, fps, sink, bitrate) => {
-    let post = Promise.resolve(), buf = [], size = 0, done = 0, err = null;
-    for (const k in PERF) PERF[k] = 0;
-    const T0 = performance.now();
-    const send = () => { if (!size) return; const body = new Blob(buf), n = done; buf = []; size = 0; post = post.then(() => fetch(`${sink}?n=${n}`, { method: 'POST', body })); };
-    const enc = new VideoEncoder({ output: c => { const b = new Uint8Array(c.byteLength); c.copyTo(b); buf.push(b); size += b.length; if (size > 2e6) send(); }, error: e => err = e });
-    enc.configure({ codec: 'avc1.640034', width: canvas.width, height: canvas.height, bitrate, framerate: fps, bitrateMode: 'variable',
-      latencyMode: 'quality', hardwareAcceleration: /Mac/.test(navigator.userAgent) ? 'prefer-hardware' : 'no-preference', avc: { format: 'annexb' } });
-    for (let n = n0; n < n1; n++) {
-      if (err) throw err;
-      const r0 = performance.now(); await render(n / fps);
-      const e0 = performance.now(); PERF.render += e0 - r0;
-      const f = new VideoFrame(canvas, { timestamp: Math.round((n - n0) * 1e6 / fps), duration: Math.round(1e6 / fps) });
-      enc.encode(f, { keyFrame: (n - n0) % (2 * fps) === 0 }); f.close(); done = n - n0 + 1;
-      const q0 = performance.now(); PERF.submit += q0 - e0;
-      while (enc.encodeQueueSize > 3) await new Promise(r => enc.addEventListener('dequeue', r, { once: true }));
-      PERF.encWait += performance.now() - q0;
-    }
-    const f0 = performance.now(); await enc.flush(); if (err) throw err; send(); await post; PERF.flush = performance.now() - f0;
-    PERF.total = performance.now() - T0; PERF.frames = done;
-    return { done, perf: { ...PERF } };
-  };
-  window.HAS_WEBCODECS = typeof VideoEncoder === 'function';
+  // window.encodeStart / encodeUnit / encodeEnd: render and hardware-encode right here (lib/encode.js)
+  installEncoder(canvas, render, PERF);
   window.framePNG = async t => { await render(t); return canvas.toDataURL('image/png').split(',')[1]; };   // lossless, for QC
   window.frameJPEG = async (t, q = .92) => { await render(t); return canvas.toDataURL('image/jpeg', q).split(',')[1]; };
   window.DUR = tl.duration;

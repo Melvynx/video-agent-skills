@@ -23,9 +23,10 @@ const db = x => Math.pow(10, x / 20);
 function trackBed(M, src, P, T, X) {
   const f = src.replace(/^~/, os.homedir()), file = path.isAbsolute(f) ? f : P(f);
   if (!fs.existsSync(file)) throw new Error(`music.src not found: ${file}`);
-  const pcm = execFileSync(FFMPEG, ['-v', 'error', ...(M.offset ? ['-ss', String(M.offset)] : []), '-i', file, '-ac', '2', '-ar', String(SR), '-f', 'f32le', '-'], { maxBuffer: 1 << 30 });
-  const a = new Float32Array(pcm.buffer, pcm.byteOffset, pcm.length / 4), L = a.length >> 1; if (!L) throw new Error(`music.src decoded empty: ${file}`);
   const i0 = Math.max(0, Math.round((M.start ?? 0) * SR)), i1 = Math.min(X.N, Math.round(Math.min(T, M.end ?? T) * SR)), fi = (M.fi ?? .4) * SR, fo = (M.fo ?? 1.2) * SR;
+  // decode only the stretch laid (+1 s): the library beds run 150 s, a short uses 30
+  const pcm = execFileSync(FFMPEG, ['-v', 'error', ...(M.offset ? ['-ss', String(M.offset)] : []), '-i', file, '-t', String(Math.max(0, i1 - i0) / SR + 1), '-ac', '2', '-ar', String(SR), '-f', 'f32le', '-'], { maxBuffer: 1 << 30 });
+  const a = new Float32Array(pcm.buffer, pcm.byteOffset, pcm.length / 4), L = a.length >> 1; if (!L) throw new Error(`music.src decoded empty: ${file}`);
   for (let i = i0; i < i1; i++) {
     const k = (i - i0) % L, e = Math.min(1, (i - i0) / fi, (i1 - i) / fo);
     X.MUS[0][i] += a[2 * k] * e; X.MUS[1][i] += a[2 * k + 1] * e;
@@ -123,7 +124,8 @@ export async function buildAudio(proj, raw) {
   else if ((bed || spec.music?.src) && !spec.music.mute) trackBed(spec.music, bed || raw.music.src, P, T, X);
   else if (!spec.music?.mute) score(spec, tl, X);
   sfxCues(spec, tl, X);
-  const RV = freeverb(X.REV[0], X.REV[1], N);
+  // nothing sent to the reverb (no synth SFX): its output is all zeros, skip the 8 combs x 2 over the whole short
+  const RV = X.REV.some(c => c.some(v => v !== 0)) ? freeverb(X.REV[0], X.REV[1], N) : [new Float32Array(N), new Float32Array(N)];
   const BED = [new Float32Array(N), new Float32Array(N)], FX = [new Float32Array(N), new Float32Array(N)], EV = [new Float32Array(N), new Float32Array(N)];
   for (let c = 0; c < 2; c++) for (let i = 0; i < N; i++) { BED[c][i] = X.MUS[c][i] + X.DRM[c][i] * .9 + RV[c][i] * .5; EV[c][i] = X.SFX[c][i]; FX[c][i] = X.SFX[c][i] + X.NZ[c][i] + RV[c][i] * .5; }
   // soft sfx (spec.sfx.appear = 'slide'): the slides live on the noise bus, so normalize the whole FX bus
@@ -169,7 +171,10 @@ export async function buildAudio(proj, raw) {
   const buf = Buffer.alloc(44 + N * 6);
   buf.write('RIFF', 0); buf.writeUInt32LE(36 + N * 6, 4); buf.write('WAVEfmt ', 8); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(2, 22);
   buf.writeUInt32LE(SR, 24); buf.writeUInt32LE(SR * 6, 28); buf.writeUInt16LE(6, 32); buf.writeUInt16LE(24, 34); buf.write('data', 36); buf.writeUInt32LE(N * 6, 40);
-  for (let i = 0; i < N; i++) for (let c = 0; c < 2; c++) buf.writeIntLE(Math.max(-8388608, Math.min(8388607, Math.round(Y[c][i] * 8388607))), 44 + i * 6 + c * 3, 3);
+  for (let i = 0; i < N; i++) for (let c = 0; c < 2; c++) {   // 24-bit little endian by hand (faster than writeIntLE)
+    const v = Math.max(-8388608, Math.min(8388607, Math.round(Y[c][i] * 8388607))), o = 44 + i * 6 + c * 3;
+    buf[o] = v & 255; buf[o + 1] = v >> 8 & 255; buf[o + 2] = v >> 16 & 255;
+  }
   fs.writeFileSync(P('assets/mix.wav'), buf);
   // spec.mix.stem: also write assets/fx.wav = music + SFX without the voice, pre-master, levelled against a -16 LUFS voice.
   // The youtube-editing mix route lays it over the Tella master's own voice (scripts/mix_splice.mjs).

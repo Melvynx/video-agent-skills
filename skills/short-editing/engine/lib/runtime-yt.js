@@ -8,6 +8,7 @@
 // Draw order: page paper -> stage (clipped left of the deckle edge) -> camera -> edge shadow -> 'over' scenes (output px, 1920x1080, unmoved by the layout) ->
 // full-screen B-roll -> 'top' scenes (output px, above the B-roll) -> captions (off unless captions.on).
 import * as K from './kit.js';
+import { installEncoder } from './encode.js';
 import { mapper, mapSpec, captionChunks } from './timeline.js';
 import { SCENES, drawActor, actorNeeds, linkScenes } from './scenes.js';
 import { withStyle, themeOf, CAPTION_FONTS, mixHex } from './style.js';
@@ -38,6 +39,7 @@ export async function boot() {
   const cache = new Map();
   // prefetch depth (?ahead=n, default 8) and an LRU that grows with it, so a prefetch never evicts the frame being drawn
   const AHEAD = +new URLSearchParams(location.search).get('ahead') || 8;
+  const PERF = { load: 0, render: 0, submit: 0, encWait: 0, flush: 0, total: 0, frames: 0 };   // see runtime.js
   let imgCap = 48;
   const load = url => {
     let p = cache.get(url);
@@ -49,7 +51,8 @@ export async function boot() {
   const camURL = t => `/p/frames/cam/${pad5(clamp(Math.round(t * FPS), 0, frames.cam - 1))}.jpg`;
   // a media with sync: true was extracted on the cut timeline (short.mjs), its frame index is SHORT time like the cam
   const brollT = (b, t) => frames.media[b.media]?.sync ? t : Math.max(0, (b.offset || 0) + t - b.from);
-  const mediaURL = (id, ct) => { const m = frames.media[id]; return m ? `/p/frames/media/${id}/${pad5(clamp(Math.round(ct * FPS), 0, m.count - 1))}.${m.ext || 'jpg'}` : null; };
+  // m.alias: a frame identical to an earlier one loads that one (one fetch + decode, then the image cache hits)
+  const mediaURL = (id, ct) => { const m = frames.media[id]; if (!m) return null; const i = clamp(Math.round(ct * FPS), 0, m.count - 1); return `/p/frames/media/${id}/${pad5(m.alias?.[i] ?? i)}.${m.ext || 'jpg'}`; };
   const logoUsers = [...(spec.actors || []), ...(spec.scenes || [])].map(o => {
     const urls = new Set(), walk = v => { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) k === 'imgs' && Array.isArray(x) ? x.forEach(u => typeof u === 'string' && urls.add('/p/' + u)) : k === 'imgKeys' && Array.isArray(x) ? x.forEach(e => typeof e?.[1] === 'string' && urls.add('/p/' + e[1])) : (k === 'logo' || k === 'labelLogo' || k === 'img' || k === 'avatarImg') && typeof x === 'string' && /\.(png|jpe?g|webp)$/i.test(x) ? urls.add('/p/' + x) : walk(x); };
     walk(o); return { from: o.from - (o.pre || 0), to: o.to, urls: [...urls] };
@@ -223,13 +226,14 @@ export async function boot() {
   }
   async function render(t) {
     const urls = needs(t); imgCap = Math.max(imgCap, urls.length * (AHEAD + 2) + 16);
-    const imgs = new Map(await Promise.all(urls.map(async u => [u, await load(u)])));
+    const w0 = performance.now(), imgs = new Map(await Promise.all(urls.map(async u => [u, await load(u)])));
+    PERF.load += performance.now() - w0;
     for (let k = 1; k <= AHEAD; k++) needs(t + k / FPS).forEach(load);   // prefetch AHEAD frames in parallel (see runtime.js)
     ctx.setTransform(scale, 0, 0, scale, 0, 0);
     ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none';
     const x = seamAt(t), dx = stageX(x);
     const camT = () => camFit(t, x);
-    const R = { ctx, t, spec, tl, cam: imgs.get(camURL(t)), frame: (id, ct) => imgs.get(mediaURL(id, ct)) || null, img: u => imgs.get(u) || null, U, camT, pause: pz, pauseP: pauseP(t), allChunks, seam: SH, seamRef: SH };
+    const R = { ctx, t, spec, tl, cam: imgs.get(camURL(t)), frame: (id, ct) => imgs.get(mediaURL(id, ct)) || null, media: id => frames.media[id], img: u => imgs.get(u) || null, U, camT, pause: pz, pauseP: pauseP(t), allChunks, seam: SH, seamRef: SH };
     ctx.drawImage(BG, 0, 0, OW, OH);
     if (x > 4) {
       ctx.save(); ctx.clip(edgePath(edgeAt(x), LEFT)); ctx.translate(dx, 0);
@@ -248,22 +252,7 @@ export async function boot() {
     captions(t, x);
   }
 
-  window.encodeRange = async (n0, n1, fps, sink, bitrate) => {
-    let post = Promise.resolve(), buf = [], size = 0, done = 0, err = null;
-    const send = () => { if (!size) return; const body = new Blob(buf), n = done; buf = []; size = 0; post = post.then(() => fetch(`${sink}?n=${n}`, { method: 'POST', body })); };
-    const enc = new VideoEncoder({ output: c => { const b = new Uint8Array(c.byteLength); c.copyTo(b); buf.push(b); size += b.length; if (size > 2e6) send(); }, error: e => err = e });
-    enc.configure({ codec: 'avc1.640034', width: canvas.width, height: canvas.height, bitrate, framerate: fps, bitrateMode: 'variable',
-      latencyMode: 'quality', hardwareAcceleration: /Mac/.test(navigator.userAgent) ? 'prefer-hardware' : 'no-preference', avc: { format: 'annexb' } });
-    for (let n = n0; n < n1; n++) {
-      if (err) throw err;
-      await render(n / fps);
-      const f = new VideoFrame(canvas, { timestamp: Math.round((n - n0) * 1e6 / fps), duration: Math.round(1e6 / fps) });
-      enc.encode(f, { keyFrame: (n - n0) % (2 * fps) === 0 }); f.close(); done = n - n0 + 1;
-      while (enc.encodeQueueSize > 3) await new Promise(r => enc.addEventListener('dequeue', r, { once: true }));
-    }
-    await enc.flush(); if (err) throw err; send(); await post; return done;
-  };
-  window.HAS_WEBCODECS = typeof VideoEncoder === 'function';
+  installEncoder(canvas, render, PERF);   // window.encodeStart / encodeUnit / encodeEnd (lib/encode.js)
   window.framePNG = async t => { await render(t); return canvas.toDataURL('image/png').split(',')[1]; };
   window.frameJPEG = async (t, q = .92) => { await render(t); return canvas.toDataURL('image/jpeg', q).split(',')[1]; };
   window.DUR = tl.duration;

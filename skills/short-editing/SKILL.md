@@ -113,7 +113,7 @@ Plain numbers = SHORT time, an `s` suffix = SOURCE time. Take one still per beat
 node <skill>/engine/short.mjs all video-agent/edits/short-<slug>
 ```
 
-Render + audio (ducked voice, music bed, SFX) + final (mux, poster, QC). About 1 to 3 s of render per second of short on a laptop: run it in the background and say how long. The QC line must read `h264 1080 1920` (or `1080 1080`, `1920 1080`), a duration equal to the timeline, about -14 LUFS and a true peak at or under -1 dBTP (else `mix: { ceil: -2.2 }` in the spec, then `audio` and `final` again). Draft: `render ... --scale .5`.
+Render + audio (ducked voice, music bed, SFX, mixed beside the render) + final (mux, poster, QC), all at once. On an Apple Silicon Mac a 36 s short takes about 5 s (the render alone about 4 s, 250 fps, WebCodecs H.264 inside Chrome with 2 workers); slower machines take longer, so run it in the background and say how long. After a sound change, rerun only `audio` and `final`. The QC line must read `h264 1080 1920` (or `1080 1080`, `1920 1080`), a duration equal to the timeline, about -14 LUFS and a true peak at or under -1 dBTP (else `mix: { ceil: -2.2 }` in the spec, then `audio` and `final` again). Draft: `render ... --scale .5`.
 
 ## Quality bar (every contact sheet)
 

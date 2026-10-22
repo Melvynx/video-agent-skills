@@ -196,8 +196,10 @@ export function lufs(B) {
     }
     return y;
   });
-  const bl = Math.round(.4 * SR), hop = Math.round(.1 * SR);
-  for (let i = 0; i + bl <= N; i += hop) { let z = 0; for (let j = i; j < i + bl; j++) z += kw[0][j] ** 2 + kw[1][j] ** 2; zs.push(z / bl); }
+  // a 400 ms block = 4 hops of 100 ms: sum each hop once instead of each sample 4 times
+  const bl = Math.round(.4 * SR), hop = Math.round(.1 * SR), hs = [];
+  for (let i = 0; i + hop <= N; i += hop) { let z = 0; for (let j = i; j < i + hop; j++) z += kw[0][j] ** 2 + kw[1][j] ** 2; hs.push(z); }
+  for (let k = 0; k + 4 <= hs.length; k++) zs.push((hs[k] + hs[k + 1] + hs[k + 2] + hs[k + 3]) / bl);
   const L = z => -.691 + 10 * Math.log10(z + 1e-12), abs = zs.filter(z => L(z) > -70);
   if (!abs.length) return -99;
   const rel = L(abs.reduce((a, b) => a + b, 0) / abs.length) - 10, g = abs.filter(z => L(z) > rel);

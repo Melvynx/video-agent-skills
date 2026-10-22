@@ -1264,8 +1264,9 @@ const overlay = {
     const to = s.to ?? 1e9; if (t < s.from || t > to) return;
     const img = R.frame(s.media, clipTime(t, s.from, s.offset || 0)); if (!img) return;
     const f = s.fade || 0, a = f ? Math.min(1, (t - s.from) / f, (to - t) / f) : 1;
-    const [x, y, w, h] = s.rect || [0, 0, W, H];
-    alpha(R.ctx, a, () => R.ctx.drawImage(img, x, y, w, h));
+    const [x, y, w, h] = s.rect || [0, 0, W, H], m = R.media?.(s.media), c = m?.crop;   // crop: only the clip's visible box is stored
+    const kx = c ? w / m.w : 0, ky = c ? h / m.h : 0;
+    alpha(R.ctx, a, () => c ? R.ctx.drawImage(img, x + c[0] * kx, y + c[1] * ky, c[2] * kx, c[3] * ky) : R.ctx.drawImage(img, x, y, w, h));
   },
 };
 
